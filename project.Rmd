@@ -1247,4 +1247,4 @@ Následne bol odhadnutý geometrický Brownov pohyb, ktorý slúžil ako základ
 
 Druhým modelom bol Hestonov model so stochastickou volatilitou. Keďže okamžitá volatilita nie je priamo pozorovateľná, bola najprv odhadnutá pomocou sGARCH a eGARCH modelu. Takto získaný časový rad volatility bol použitý na odhad parametrov Hestonovho modelu. Hestonov model poskytuje realistickejší rámec pre modelovanie časovo premenlivej volatility, no jeho výsledky závisia od kvality odhadu latentnej volatility.
 
-Celkovo možno povedať, že GBM je vhodný ako jednoduchý východiskový model, zatiaľ čo Hestonov model lepšie vystihuje základnú vlastnosť finančných dát: volatilita nie je konštantná, ale mení sa v čase. Napriek väčšej komplexnosti, zdá sa, GBM opisuje dáta lepšie.
+Celkovo možno povedať, že GBM je vhodný ako jednoduchý východiskový model, zatiaľ čo Hestonov model lepšie vystihuje základnú vlastnosť finančných dát: volatilita nie je konštantná, ale mení sa v čase. Napriek jednoduchosti odhadnutia volatility pomocou GARCH modelov, Hestonov model ukazuje sľubné výsledky s užším pásom spolahlivosti.
