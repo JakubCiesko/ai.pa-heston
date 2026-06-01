@@ -1,0 +1,1250 @@
+---
+title: "Analýza cien akcií Air Liquide (AI.PA)"
+author: "Jakub Čieško"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  dev = "ragg_png",
+  dpi = 150,
+  fig.width = 14,
+  fig.height = 6,
+  out.width = "100%"
+)
+```
+
+```{css, echo=FALSE}
+.main-container {
+  max-width: 1300px !important;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+pre {
+  max-height: 450px;
+  overflow-y: auto;
+  overflow-x: auto;
+}
+```
+
+# Úvod
+
+Cieľom projektu je analyzovať upravené uzavieracie ceny akcií (adjusted closing prices) spoločnosti Air Liquide (AI.PA) od dátumu 1.1.2000 do dneška s využitím dvoch modelov: Geometrický Brownov pohyb (GBM) a (zjednodušený) Hestonov model.
+
+## Air Liquide
+
+Air Liquide, predtým L'Air Liquide, je francúzska medzinárodná priemyselná skupina, ktorá sa špecializuje na výrobu priemyselných plynov. Skupina bola založená v roku 1902 a sídli v Paríži. Pôsobí v osemdesiatich krajinách sveta a má viac ako 3,6 milióna zákazníkov, najmä z oblasti medicínskeho, chemického a elektronického priemyslu. Po spoločnosti Linde ide o druhého najväčšieho výrobcu priemyselných plynov na svete. Air Liquide je kótovaná na európskej burze cenných papierov Euronext a je zahrnutá v burzových indexoch Euro Stoxx 50, CAC 40 a FTSE4Good.
+
+Medzi hlavné oblasti činnosti spoločnosti patrí výroba technických plynov, inžinierstvo a technické štúdie. V roku 2025 dosiahla spoločnosť obrat 26,9 mld. € a prevádzkový zisk 5,6 mld. €. Výsledok hospodárenia za rok 2025 predstavoval 3,5 mld. €. V roku 2024 dosiahla spoločnosť obrat 27,1 mld. €, prevádzkový zisk 5,4 mld. € a výsledok hospodárenia 3,3 mld. €.
+
+Medzi dcérske spoločnosti skupiny patria napríklad Air Liquide v Spojených štátoch, Kanade, Spojenom kráľovstve, Nemecku a Rakúsku, ďalej Air Liquide France Industrie, Lurgi AG, Société d'Oxygène et d'Acétylène d'Extrême-Orient a Airgas.
+
+Oficiálna webová stránka spoločnosti je [www.airliquide.com](https://www.airliquide.com).
+
+Zdroje:\
+- Finančné údaje za rok 2025: [Air Liquide Universal Registration Document 2025](https://www.airliquide.com/sites/airliquide.com/files/2026-03/air-liquide-document-enregistrement-universel-interactif-2025.pdf)\
+- Finančné údaje za rok 2024: [Air Liquide Universal Registration Document 2024](https://www.airliquide.com/sites/airliquide.com/files/2025-03/air-liquide-document-enregistrement-universel-2024.pdf)\
+- Všeobecné informácie: [Wikipedia – Air Liquide](https://cs.wikipedia.org/wiki/Air_Liquide)
+
+# Dáta
+
+Dáta získame pomocou knižnice quantmod z Yahoo Finance a určíme počet obchodovacích dní, s ktorým budeme ďalej pracovať (256 dní v roku).
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+library(quantmod)
+library(ggplot2)
+library(patchwork)
+library(nortest)
+library(dplyr)
+library(tidyr)
+library(rugarch)
+source("chart_theme.R")
+```
+
+```{r}
+ticker <- "AI.PA"
+start_date <- "2000-01-01"
+data <- getSymbols(ticker, src="yahoo", from=start_date, env=NULL)
+str(data)
+```
+
+```{r}
+year_counts <- table(format(index(data), "%Y"))
+year_counts_full <- year_counts[names(year_counts) != "2026"]
+trading_days_in_year <- median(year_counts_full)
+dt <- 1/trading_days_in_year
+transformations <- data.frame(
+  day_to_year_std = sqrt(trading_days_in_year),
+  year_to_day_std = 1 / sqrt(trading_days_in_year),
+
+  day_to_year_vol = sqrt(trading_days_in_year),
+  year_to_day_vol = 1 / sqrt(trading_days_in_year),
+
+  day_to_year_var = trading_days_in_year,
+  year_to_day_var = 1 / trading_days_in_year
+)
+c(trading_days_in_year=trading_days_in_year, time_step=round(dt, 4))
+```
+
+## Analýza dát
+
+Dáta si najprv vykreslíme. Budeme pracovať s upravenými uzavieracími cenami akcií. Quantmod nám umožňuje tieto ceny veľmi jednoducho vykresliť spolu s volatilitou a množstvom obchodovaných akcií.
+
+```{r fig.width=14, fig.height=10}
+chartSeries(
+  data,
+  type = "candlesticks",
+  theme = quantmod_theme(),
+  name = "Air Liquide (AI.PA)",
+  TA = "addVo(); addVolatility()"
+)
+```
+
+```{r}
+prices <- as.numeric(na.omit(data$AI.PA.Adjusted))
+write.csv(data.frame(
+  date = index(na.omit(data$AI.PA.Adjusted)),
+  AI.PA.Adjusted = prices
+), "./ai_pa_prices_adjusted.csv",row.names=F)
+```
+
+Nižšie môžeme vidieť číselné charakteristiky dát.
+
+```{r}
+summary(c(std=sd(prices), summary=prices))
+```
+
+# Geometrický Brownov Pohyb (GBM)
+
+## Definícia
+
+Predpokladáme, že cena akcií sa riadi GBM, ktorý je daný nasledujúcou stochastickou diferenciálnou rovnicou. 
+$$
+dX(t) = \mu X(t)dt + \sigma X(t) dW(t), \quad X(0) = x_0,
+$$
+kde X(t) je cena akcie v čase t, $x_0$ je počiatočná cena, $\mu$ je drift, $\sigma$ je volatilita a $W(t)$ je Wienerov proces v čase $t$.
+Riešenie tejto rovnice je nasledovné:
+$$
+X(t) = X(0)e^{(\mu-\frac{1}{2}\sigma^2)t + \sigma W(t)}
+$$
+Taktiež platí, že geometrický Brownov pohyb sa správa podľa log-normálneho rozdelenia
+$$
+X(t) \sim LN(\text{ln}x_0 + (\mu - \frac{1}{2}\sigma^2)t, \sigma^2t), \forall t \geq 0
+$$
+Pri modelovaní ceny akcie sa ale namiesto samotných cien používajú **logaritmické výnosy**. Pre cenu akcie $P_i$ v čase $i$ je logaritmický výnos definovaný ako
+
+$$
+r_i = \ln\left(\frac{P_{i+1}}{P_i}\right)
+    = \ln(P_{i+1}) - \ln(P_i).
+$$
+Logaritmické výnosy sú vhodné aj preto, že prirodzene vyplývajú z riešenia geometrického Brownovho pohybu.
+
+## Overenie predpokladov
+
+Pred samotným odhadom parametrov a simulovaním je vhodné preskúmať základné vlastnosti dát, ktoré su potrebné ako predpoklady pre model GBM.
+
+### Normaliza $R_i$
+
+Geometrický Brownov pohyb predpokladá, že logaritmické výnosy sú normálne rozdelené. Tento predpoklad možno vizuálne skontrolovať pomocou histogramu, odhadnutej hustoty a Q-Q grafu. Formálne je možné použiť aj test normality (napríklad Lillieforsov test).
+
+$$
+r_i \sim \mathcal{N}((\mu-\frac{1}{2}\sigma^2)\Delta t, \sigma^2 \Delta t)
+$$
+
+```{r}
+logreturns <- function(prices) {
+  na.omit(as.numeric(diff(log(prices))))
+}
+r <- logreturns(prices)
+```
+
+
+
+```{r}
+c(std=sd(r), summary=summary(r))
+```
+Najprv sa pozrieme na graf logaritmických výnosov. Nemalá frekvencia presahov empirického 5.a 95. nám naznačuje, že by dáta nemuseli byť normálne rozdelené.
+```{r}
+plot(r, type="l")
+abline(h=mean(r), col="red")
+q <- quantile(r, 0.975)
+abline(h=mean(r) + q, col="red", lty=2)
+abline(h=mean(r) - q, col="red", lty=2)
+```
+Podobné podozrenie môžeme získať aj z histogramu s jadrovým odhadom hustoty. Zdá sa, že dáta nie sú normálne rozdelené, a majú napríklad ťažšie chvosty a väčšiu špicatosť.  
+```{r}
+name <- "AI.PA Adjusted Prices"
+data.frame(value = r) |> ggplot(aes(x = value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 60, alpha = 0.4) +
+  geom_density(linewidth = 1) +
+  stat_function(
+    fun = dnorm,
+    args = list(mean = mean(r), sd = sd(r)),
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  labs(
+    title = paste("Density check:", name),
+    subtitle = "Histogram + kernel density + fitted normal curve",
+    x = name,
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+Na základe Q-Q grafu (viď nižšie) môžeme teoretickú príslušnosť k normálnemu rozdeleniu takmer úplne vylúčiť.
+
+```{r}
+data.frame(value = r) |>  ggplot(aes(sample = value)) +
+    stat_qq(alpha = 0.6) +
+    stat_qq_line(linewidth = 1) +
+    labs(
+      title = paste("Q-Q plot:", name),
+      x = "Theoretical normal quantiles",
+      y = "Sample quantiles"
+    ) +
+    theme_minimal(base_size = 13)
+```
+
+Výsledok Lillieforsovho testu normality taktiež hovorí, že normalitu dát nemôžeme predpokladať.
+V praxi je to pri finančných dátach bežné. Výnosy často vykazujú hrubšie chvosty, zhluky volatility a extrémne hodnoty, ktoré jednoduchý GBM model nezachytáva. Napriek tomu je GBM užitočný ako základný referenčný model.
+
+
+```{r}
+print(lillie.test(r))
+```
+
+### Nekorelovanosť $R_i$
+Ďalším predpokladom GBM je nekorelovanosť logaritmických výnosov v čase. Autokorelačná funkcia logaritmických výnosov slúži na overenie, či medzi výnosmi existuje výrazná lineárna závislosť v čase.
+
+Na základe grafu ACF môžeme povedať, že výnosy sú do istej malej miery korelované, najmä pokiaľ ide o lag 1. Pri väčšine ostatných oneskorení sa hodnoty autokorelácie nachádzajú blízko nuly a v rámci intervalov spoľahlivosti. Napriek tomu ale vykonáme Box-Ljungov test.
+```{r}
+acf(r, main = 'ACF(R)')
+```
+```{r}
+Box.test(r, lag = 20, type = "Ljung-Box")
+```
+
+```{r}
+Box.test(r^2, lag = 20, type = "Ljung-Box")
+```
+Môžeme teda zamietnuť nezávislosť logaritmických výnosov. 
+
+
+## Odhad parametrov
+Parametre $\mu, \sigma$ GBM môžeme odhadnúť pomocou metódy MLE ako: 
+$$
+\hat{\mu} = \frac{\bar{\mu}}{\Delta t} + \frac{S_R^2}{2\Delta t} \\
+\hat{\sigma}^2 = \frac{S_R^2}{\Delta t},
+$$
+kde $S_R^2$ je výberový rozptyl, $\bar{\mu}$ je výberový priemer a $\Delta t$ je časový krok.
+
+
+```{r}
+sigma_hat <- sqrt( var(r) / dt )
+mu_hat <- mean(r)/dt + 1/2 * sigma_hat^2 
+data.frame(sigma_hat=sigma_hat, mu_hat=mu_hat)
+```
+
+## Simulácia
+
+V tejto časti nasimulujeme 10 000 trajektórií GBM. Využijeme na to získané odhady parametrov. Ako počiatočnú hodnotu akcie stanovíme prvú cenu akcie z našich dát. Na grafe môžeme vidieť 1 000 trajektórií.
+
+```{r}
+gen.wp <- function(N, dt){
+  c(0, cumsum(rnorm(N-1, 0, sqrt(dt))))
+}
+
+gen.gbm <- function(mu, sigma, s0, N, dt) {
+  Wt <- gen.wp(N, dt)
+  t <- seq(from=0,to=(N-1)*dt, by=dt)
+  return (s0*exp((mu-sigma^2/2)*t + sigma*Wt))
+}
+
+sim.gbm <- function(mu, sigma, s0, N, dt, N_simulations) {
+  replicate(N_simulations, gen.gbm(mu, sigma, s0, N, dt))
+}
+```
+
+```{r}
+set.seed(123)
+
+n_paths_to_plot <- 1000
+N_simulations <- 10000
+N <- length(r) + 1
+
+gbm.data <- sim.gbm(
+  mu_hat,
+  sigma_hat,
+  as.vector(prices[1]),
+  N,
+  dt,
+  N_simulations
+)
+```
+
+```{r}
+price_dates <- index(na.omit(data))
+
+real_price_df <- data.frame(
+  date = price_dates,
+  value = as.numeric(prices)
+)
+
+sim_quantiles <- t(apply(
+  gbm.data,
+  1,
+  quantile,
+  probs = c(0.05, 0.25, 0.50, 0.75, 0.95),
+  na.rm = TRUE
+))
+
+gbm_simulation_bands_df <- data.frame(
+  date = price_dates,
+  q05 = sim_quantiles[, "5%"],
+  q25 = sim_quantiles[, "25%"],
+  q50 = sim_quantiles[, "50%"],
+  q75 = sim_quantiles[, "75%"],
+  q95 = sim_quantiles[, "95%"]
+)
+selected_paths <- sample(
+  seq_len(ncol(gbm.data)),
+  size = min(n_paths_to_plot, ncol(gbm.data))
+)
+
+simulation_df_small <- as.data.frame(gbm.data[, selected_paths, drop = FALSE]) |>
+  mutate(date = price_dates) |>
+  tidyr::pivot_longer(
+    cols = -date,
+    names_to = "series",
+    values_to = "value"
+  )
+
+ggplot() +
+  geom_ribbon(
+    data = gbm_simulation_bands_df,
+    aes(
+      x = date,
+      ymin = q05,
+      ymax = q95,
+      fill = "5%–95% simulation band"
+    ),
+    alpha = 0.30,
+    linewidth = 0.25
+  ) +
+  geom_ribbon(
+    data = gbm_simulation_bands_df,
+    aes(
+      x = date,
+      ymin = q25,
+      ymax = q75,
+      fill = "25%–75% simulation band"
+    ),
+    alpha = 0.45, 
+    linewidth = 0.25
+  ) +
+  geom_line(
+    data = simulation_df_small,
+    aes(
+      x = date,
+      y = value,
+      group = series,
+      color = "Simulated GBM paths"
+    ),
+    alpha = 0.06,
+    linewidth = 0.25
+  ) +
+  geom_line(
+    data = gbm_simulation_bands_df,
+    aes(
+      x = date,
+      y = q50,
+      color = "Median simulated path"
+    ),
+    linewidth = 0.9
+  ) +
+  geom_line(
+    data = real_price_df,
+    aes(
+      x = date,
+      y = value,
+      color = "Real adjusted price"
+    ),
+    linewidth = 1.25
+  ) +
+  scale_color_manual(
+    values = c(
+      "Simulated GBM paths" = "steelblue",
+      "Median simulated path" = "blue",
+      "Real adjusted price" = "black"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "5%–95% simulation band" = "steelblue",
+      "25%–75% simulation band" = "steelblue"
+    )
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y"
+  ) +
+  labs(
+    title = "GBM simulation compared with real Air Liquide price",
+    subtitle = "1000 simulated paths, quantile bands, and observed adjusted closing price",
+    x = "Date",
+    y = "Adjusted closing price",
+    color = NULL,
+    fill = NULL
+  ) +
+  coord_cartesian(ylim = c(0, 600)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 12),
+    legend.position = "bottom",
+    legend.text = element_text(size = 12),
+    panel.grid.minor = element_blank()
+  )
+```
+```{r}
+terminal_gbm <- gbm.data[nrow(gbm.data), ]
+real_terminal <- as.numeric(tail(prices, 2))[1]
+
+terminal_summary <- data.frame(
+  model = c("gbm"),
+  q01 = c(
+    quantile(terminal_gbm, 0.01)
+  ),
+  q05 = c(
+    quantile(terminal_gbm, 0.05)
+  ),
+  q25 = c(
+    quantile(terminal_gbm, 0.25)
+  ),
+  q50 = c(
+    quantile(terminal_gbm, 0.50)
+  ),
+  q75 = c(
+    quantile(terminal_gbm, 0.75)
+  ),
+  q95 = c(
+    quantile(terminal_gbm, 0.95)
+  ),
+  q99 = c(
+    quantile(terminal_gbm, 0.99)
+  ),
+  ratio_below_real = c(
+    mean(terminal_gbm <= real_terminal)
+  )
+)
+
+terminal_summary
+```
+
+
+```{r}
+rm(simulation_df_small)
+#rm(simulation_bands_df)
+rm(gbm.data)
+simulation_df_small <- NULL
+
+simulation_bands_df <- NULL
+gbm.data <- NULL
+gc()
+```
+
+# Hestonov model
+Hestonov model rozširuje GBM tým, že volatilita nie je konštantná, ale mení sa v čase.
+
+## Definícia
+Model je daný sústavou dvoch stochastických diferenciálnych rovníc:
+$$
+dS(t) = \mu S(t) dt + \sqrt{\nu(t)}S(t)dW_S(t) \\
+d\nu(t) = \kappa(\theta - \nu(t))dt + \xi\sqrt{\nu(t)}dW_\nu(t),
+$$
+Pričom pre procesy $W_S(t)$ a $W_\nu(t)$ platí:
+$$
+dW_S(t)dW_\nu(t)=\rho dt
+$$
+Premenná $\nu(t)$ označuje okamžitý rozptyl ceny. Parameter $\kappa$ určuje rýchlosť návratu volatility k dlhodobej úrovni, $\theta$ je dlhodobá priemerná úroveň rozptylu, $\xi$ je volatilita volatility a $\rho$ vyjadruje koreláciu medzi šokmi ceny a šokmi volatility.
+
+## Odhad volatility pomocou GARCH(1, 1)
+
+Na rozdiel od ceny akcie nie je okamžitá volatilita priamo pozorovateľná. Pri kalibrácii Hestonovho modelu sa často používajú ceny opcií alebo implikovaná volatilita. V tomto projekte však pracujeme iba s historickými cenami akcie. Preto je potrebné volatilitu najprv odhadnúť nepriamo.
+
+Ako aproximácia časového radu volatility je použitý model GARCH. Tento prístup nie je plnohodnotnou kalibráciou Hestonovho modelu na opčných dátach, ale umožňuje vytvoriť praktický aspoň nejaký odhad časovo premenlivej volatility zo samotných historických výnosov. Model GARCH(1,1) totiž predpokladá, že dnešná volatilita závisí z od veľkosti včerajšieho cenového šoku a od včerajšej odhadnutej volatility, čím efektívne modeluje jej zhlukovanie a zotrvačnosť v čase.
+
+Použijeme dve varianty GARCH modelov, sGARCH a eGARCH. sGARCH predpokladá, že kladné aj záporné cenové šoky (kladné a záporné výnosy rovnakej veľkosti) majú na nasledujúcu volatilitu úplne rovnaký, symetrický vplyv. eGARCH reflektuje empirickú skutočnosť, že pokles cien akcií zvyčajne zvyšuje volatilitu na trhu výraznejšie ako ich nárast o rovnakú hodnotu.
+
+
+```{r}
+garch_specS <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(0, 0), include.mean = TRUE),
+  distribution.model = "std"#"std" or "norm"
+)
+garch_specE <- ugarchspec(
+  variance.model = list(model = "eGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(0, 0), include.mean = TRUE),
+  distribution.model = "std"#"std" or "norm"
+)
+```
+
+```{r}
+garch_fitS <- ugarchfit(spec = garch_specS, data = r)
+garch_fitE <- ugarchfit(spec = garch_specE, data = r)
+#garch_fit
+```
+
+
+```{r}
+sigma_tS <- as.numeric(sigma(garch_fitS)) # daily 
+sigma_tE <- as.numeric(sigma(garch_fitE))
+v_tS <- sigma_tS^2 # daily 
+v_tE <- sigma_tE^2
+vol_df <- data.frame(
+  date = price_dates[-1],
+
+  variance_sGARCH = v_tS,
+  variance_eGARCH = v_tE,
+
+  variance_sGARCH_annualized = v_tS * transformations$day_to_year_var,
+  variance_eGARCH_annualized = v_tE * transformations$day_to_year_var,
+
+  sigma_sGARCH = sigma_tS,
+  sigma_eGARCH = sigma_tE,
+
+  sigma_sGARCH_annualized = sigma_tS * transformations$day_to_year_std,
+  sigma_eGARCH_annualized = sigma_tE * transformations$day_to_year_std,
+
+  gbm_annual_vol_hat = sigma_hat
+)
+```
+
+```{r}
+vol_plot_df <- vol_df |>
+  select(
+    date,
+    `sGARCH annualized volatility` = sigma_sGARCH_annualized,
+    `eGARCH annualized volatility` = sigma_eGARCH_annualized,
+    `GBM constant volatility` = gbm_annual_vol_hat
+  ) |>
+  pivot_longer(
+    cols = -date,
+    names_to = "model",
+    values_to = "volatility"
+  )
+
+ggplot(vol_plot_df, aes(x = date, y = volatility, color = model)) +
+  geom_line(linewidth = 0.8) +
+  scale_color_manual(
+    values = c(
+      "sGARCH annualized volatility" = "steelblue",
+      "eGARCH annualized volatility" = "firebrick",
+      "GBM constant volatility" = "black"
+    )
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y"
+  ) +
+  labs(
+    title = "Annualized Conditional Volatility: sGARCH vs eGARCH vs GBM",
+    subtitle = "Time-varying GARCH volatilities compared with constant GBM volatility",
+    x = "Date",
+    y = "Annualized volatility",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 12),
+    legend.position = "bottom",
+    legend.text = element_text(size = 12),
+    panel.grid.minor = element_blank()
+  )
+```
+
+## Odhad parametrov
+
+Po získaní odhadnutého časového radu rozptylu $\nu_t$ je možné odhadnúť parametre procesu volatility. Diskretizovaná rovnica pre rozptyl má tvar
+
+$$
+\nu_t - \nu_{t-1} = \kappa(\theta - \nu_{t-1})\Delta t + \xi\sqrt{\nu_{t-1}}\sqrt{\Delta t} Z_\nu, \quad Z_\nu \sim \mathcal{N}(0, 1) \\
+$$
+Po úprave možno túto rovnicu zapísať ako lineárny regresný model. Z regresných koeficientov sa následne získajú odhady parametrov $\kappa$ a $\theta$, zatiaľ čo parameter $\xi$ sa odhadne zo smerodajnej odchýlky rezíduí:
+$$
+\frac{\nu_t - \nu_{t-1}}{\sqrt{\nu_{t-1}}} = \frac{\kappa\theta\Delta t}{\sqrt{\nu_{t-1}}} - \kappa\Delta t\sqrt{\nu_{t-1}} + \xi\sqrt{\Delta t} Z_\nu ,\quad Z_\nu \sim \mathcal{N}(0, 1) \\
+Y_t = aX_{1,t} + bX_{2, t} + \eta_t \\
+X_{1,t} = \frac{\Delta t}{\sqrt{\nu_{t-1}}},X_{2,t}=\Delta t\sqrt{\nu_{t-1}}\quad \eta_t = \xi \sqrt{\Delta t} Z_\nu\\
+a = \kappa\theta,\quad b=-\kappa,\text{ takže } \theta = \frac{a}{\kappa}\\
+\xi = \frac{sd(\eta_t)}{\sqrt{\Delta t}} 
+$$
+
+```{r}
+# old unused now
+# v_t-1
+#vt_before <- vol_df$variance_annualized[-length(vol_df$variance_annualized)]
+# v_t
+#vt_now <- vol_df$variance_annualized[-1] 
+
+#Y <- (vt_now - vt_before) / sqrt(vt_before)
+#X1 <- dt / sqrt(vt_before)
+#X2 <- dt * sqrt(vt_before)
+
+#cir_fit <- lm(Y ~ 0 + X1 + X2)
+
+#coeff_cir <- coef(cir_fit)
+#a_hat <- coeff_cir["X1"]
+#b_hat <- coeff_cir["X2"]
+
+# now coeffs
+#kappa_hat <- as.numeric(-b_hat)
+#theta_hat <- as.numeric(a_hat / kappa_hat)
+# tiez nazyvane vol-of-vol
+#xi_hat <- as.numeric(sd(resid(cir_fit)) / sqrt(dt))
+#c(kappa_hat = kappa_hat, theta_hat = theta_hat, xi_hat = xi_hat)
+```
+
+
+Drift \(\mu\) sa odhaduje z diskretizovanej rovnice pre logaritmické výnosy. Nakoniec sa korelácia \(\rho\) odhaduje ako korelácia medzi štandardizovanými rezíduami cenového procesu a procesu volatility:
+
+$$ 
+r_t = \mu \Delta t - \frac{\Delta t}{2}\nu_{t-1} +\sqrt{\nu_{t-1}\Delta t} Z_S \\ r_t + \frac{\Delta t}{2}\nu_{t-1} = \mu \Delta t + \sqrt{\nu_{t-1}\Delta t} Z_S \\ \frac{r_t + \frac{\Delta t}{2}\nu_{t-1}}{\sqrt{\nu_{t-1} \Delta t}} = \frac{\mu \sqrt{\Delta t}}{\sqrt{\nu_{t-1}}} + Z_S \\
+Y_t = \mu X_t + Z_{S,t} 
+$$
+
+```{r}
+#Y <- (r[-length(r)] + dt/2 * vt_before) / sqrt(vt_before*dt) 
+#X <- sqrt(dt) / sqrt(vt_before)
+#mu_fit <- lm(Y~X + 0)
+#mu_hat <- as.numeric(coef(mu_fit)["X"])
+#c(mu_hat=mu_hat)
+```
+
+
+$$
+\hat{\rho}
+=
+\operatorname{corr}
+\left(
+\hat{Z}_{S,t},
+\hat{Z}_{\nu,t}
+\right).
+$$
+```{r}
+#Zs_hat <- resid(mu_fit)
+#Zv_hat <- resid(cir_fit) / (xi_hat * sqrt(dt))
+#rho_hat <- cor(Zs_hat, Zv_hat)
+#c(rho_hat=rho_hat)
+```
+
+
+## Fellerova podmienka
+
+Pri Hestonovom modeli sa často kontroluje Fellerova podmienka
+
+$$
+2\kappa\theta \geq \xi^2.
+$$
+Táto podmienka zabezpečuje, že proces rozptylu zostáva striktne kladný. Ak podmienka nie je splnená, simulovaný rozptyl sa môže približovať k nule alebo sa numericky dostať do záporných hodnôt.
+Ako vidíme pre naše dáta je splnená.
+
+```{r}
+#tolerance <- 1e-5
+#2*kappa_hat*theta_hat + tolerance >= xi_hat^2 
+```
+
+
+```{r}
+estimate_heston_params <- function(vol_variance_annualized, r, dt) {
+
+  vt_before <- vol_variance_annualized[-length(vol_variance_annualized)]
+  vt_now <- vol_variance_annualized[-1]
+
+  # avoid numerical issues if variance is exactly zero
+  vt_before <- pmax(vt_before, .Machine$double.eps)
+  vt_now <- pmax(vt_now, .Machine$double.eps)
+
+  # CIR / variance-process regression
+  Y <- (vt_now - vt_before) / sqrt(vt_before)
+  X1 <- dt / sqrt(vt_before)
+  X2 <- dt * sqrt(vt_before)
+
+  cir_fit <- lm(Y ~ 0 + X1 + X2)
+
+  coeff_cir <- coef(cir_fit)
+  a_hat <- coeff_cir["X1"]
+  b_hat <- coeff_cir["X2"]
+
+  kappa_hat <- as.numeric(-b_hat)
+  theta_hat <- as.numeric(a_hat / kappa_hat)
+  xi_hat <- as.numeric(sd(resid(cir_fit)) / sqrt(dt))
+
+  # drift regression
+  Y_mu <- (r[-length(r)] + dt / 2 * vt_before) / sqrt(vt_before * dt)
+  X_mu <- sqrt(dt) / sqrt(vt_before)
+
+  mu_fit <- lm(Y_mu ~ X_mu + 0)
+  mu_hat <- as.numeric(coef(mu_fit)["X_mu"])
+
+  # correlation estimate
+  Zs_hat <- resid(mu_fit)
+  Zv_hat <- resid(cir_fit) / (xi_hat * sqrt(dt))
+
+  rho_hat <- cor(Zs_hat, Zv_hat, use = "complete.obs")
+
+  list(
+    mu_hat = mu_hat,
+    kappa_hat = kappa_hat,
+    theta_hat = theta_hat,
+    xi_hat = xi_hat,
+    rho_hat = rho_hat,
+    cir_fit = cir_fit,
+    mu_fit = mu_fit,
+    feller_ok = 2 * kappa_hat * theta_hat >= xi_hat^2
+  )
+}
+```
+
+```{r}
+heston_sGARCH <- estimate_heston_params(
+  vol_df$variance_sGARCH_annualized,
+  r,
+  dt
+)
+
+heston_eGARCH <- estimate_heston_params(
+  vol_df$variance_eGARCH_annualized,
+  r,
+  dt
+)
+
+heston_params_df <- data.frame(
+  model = c("sGARCH", "eGARCH"),
+  mu_hat = c(heston_sGARCH$mu_hat, heston_eGARCH$mu_hat),
+  kappa_hat = c(heston_sGARCH$kappa_hat, heston_eGARCH$kappa_hat),
+  theta_hat = c(heston_sGARCH$theta_hat, heston_eGARCH$theta_hat),
+  xi_hat = c(heston_sGARCH$xi_hat, heston_eGARCH$xi_hat),
+  rho_hat = c(heston_sGARCH$rho_hat, heston_eGARCH$rho_hat),
+  feller_ok = c(heston_sGARCH$feller_ok, heston_eGARCH$feller_ok)
+)
+
+heston_params_df
+```
+
+
+## Simulácia
+
+Simulácia Hestonovho modelu vyžaduje súčasnú simuláciu procesu ceny aj procesu rozptylu. Pre každý časový krok sa najprv vygenerujú dva korelované normálne šoky. Jeden ovplyvňuje cenu akcie a druhý volatilitu. Korelácia medzi nimi je určená parametrom $\rho$.
+
+Výsledkom je súbor simulovaných cenových trajektórií, ktoré majú časovo premenlivú volatilitu. V porovnaní s GBM modelom teda Hestonov model lepšie zachytáva obdobia zvýšenej a zníženej volatility. Na druhej strane je jeho odhad zložitejší a v tomto projekte závisí od kvality odhadu volatility.
+
+Znova budeme simulovať 10 000 trajektórií (vykreslíme však len 1000).
+
+```{r}
+gen.heston <- function(mu, kappa, theta, xi, rho, v0, S0, N, dt) {
+  #RANDOM VARS 
+  Zx <- rnorm(N)
+  Zv <- rnorm(N)
+  Zs <- rho*Zv+sqrt(1-rho^2)*Zx
+  # INIT
+  S <- numeric(N)
+  S[1] <- S0
+  V <- numeric(N)
+  V[1] <- v0
+  # first volatility 
+  for (i in 2:N) {
+    v_prev <- V[i-1]
+    V[i] <- max(v_prev + kappa*theta*dt - kappa*dt*v_prev + xi*sqrt(v_prev)*sqrt(dt)*Zv[i], 0)
+    S[i] <- S[i-1]*exp((mu-1/2*V[i-1])*dt + sqrt(V[i-1]*dt)*Zs[i])
+  }
+  return (S)
+}
+
+sim.heston <- function(mu, kappa, theta, xi, rho, v0, S0, N, dt, N_simulations) {
+  replicate(N_simulations, gen.heston(mu, kappa, theta, xi, rho, v0, S0, N, dt))
+}
+```
+
+```{r}
+N_simulations <- 10000
+N <- length(r) + 1
+price_dates <- index(na.omit(data))
+real_price_df <- data.frame(
+  date = price_dates,
+  value = as.numeric(prices)
+)
+
+```
+
+```{r}
+data.heston.sGARCH <- sim.heston(
+  heston_sGARCH$mu_hat,
+  heston_sGARCH$kappa_hat,
+  heston_sGARCH$theta_hat,
+  heston_sGARCH$xi_hat,
+  heston_sGARCH$rho_hat,
+  vol_df$variance_sGARCH_annualized[1],
+  as.numeric(prices[1]),
+  N,
+  dt,
+  N_simulations
+)
+
+data.heston.eGARCH <- sim.heston(
+  heston_eGARCH$mu_hat,
+  heston_eGARCH$kappa_hat,
+  heston_eGARCH$theta_hat,
+  heston_eGARCH$xi_hat,
+  heston_eGARCH$rho_hat,
+  vol_df$variance_eGARCH_annualized[1],
+  as.numeric(prices[1]),
+  N,
+  dt,
+  N_simulations
+)
+
+```
+
+```{r}
+make_heston_bands <- function(sim_data, price_dates, model_name) {
+  
+  if (nrow(sim_data) != length(price_dates) && ncol(sim_data) == length(price_dates)) {
+    sim_data <- t(sim_data)
+  }
+  
+  q_mat <- t(apply(
+    sim_data,
+    1,
+    quantile,
+    probs = c(0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99),
+    na.rm = TRUE
+  ))
+  
+  data.frame(
+    date = price_dates,
+    model = model_name,
+    q01 = q_mat[, "1%"],
+    q05 = q_mat[, "5%"],
+    q25 = q_mat[, "25%"],
+    q50 = q_mat[, "50%"],
+    q75 = q_mat[, "75%"],
+    q95 = q_mat[, "95%"],
+    q99 = q_mat[, "99%"]
+  )
+}
+
+
+make_heston_sample_paths <- function(sim_data, price_dates, model_name, n_paths_to_plot) {
+  
+  if (nrow(sim_data) != length(price_dates) && ncol(sim_data) == length(price_dates)) {
+    sim_data <- t(sim_data)
+  }
+  
+  selected_paths <- sample(
+    seq_len(ncol(sim_data)),
+    size = min(n_paths_to_plot, ncol(sim_data))
+  )
+  
+  as.data.frame(sim_data[, selected_paths, drop = FALSE]) |>
+    mutate(date = price_dates) |>
+    tidyr::pivot_longer(
+      cols = -date,
+      names_to = "series",
+      values_to = "value"
+    ) |>
+    mutate(
+      model = model_name,
+      series = paste(model_name, series, sep = "_")
+    )
+}
+```
+
+```{r}
+heston_bands_sGARCH <- make_heston_bands(
+  data.heston.sGARCH,
+  price_dates,
+  "sGARCH-Heston"
+)
+
+heston_bands_eGARCH <- make_heston_bands(
+  data.heston.eGARCH,
+  price_dates,
+  "eGARCH-Heston"
+)
+
+heston_paths_sGARCH <- make_heston_sample_paths(
+  data.heston.sGARCH,
+  price_dates,
+  "sGARCH-Heston",
+  n_paths_to_plot
+)
+
+heston_paths_eGARCH <- make_heston_sample_paths(
+  data.heston.eGARCH,
+  price_dates,
+  "eGARCH-Heston",
+  n_paths_to_plot
+)
+
+heston_bands_all <- bind_rows(
+  heston_bands_sGARCH,
+  heston_bands_eGARCH
+)
+```
+
+
+```{r}
+ggplot() +
+  geom_ribbon(
+    data = heston_bands_all,
+    aes(
+      x = date,
+      ymin = q05,
+      ymax = q95,
+      fill = model
+    ),
+    alpha = 0.16
+  ) +
+  geom_ribbon(
+    data = heston_bands_all,
+    aes(
+      x = date,
+      ymin = q25,
+      ymax = q75,
+      fill = model
+    ),
+    alpha = 0.28
+  ) +
+  geom_line(
+    data = heston_bands_all,
+    aes(
+      x = date,
+      y = q50,
+      color = model
+    ),
+    linewidth = 0.9
+  ) +
+  geom_line(
+    data = real_price_df,
+    aes(
+      x = date,
+      y = value,
+      color = "Real adjusted price"
+    ),
+    linewidth = 1.25
+  ) +
+  scale_color_manual(
+    values = c(
+      "sGARCH-Heston" = "steelblue",
+      "eGARCH-Heston" = "firebrick",
+      "Real adjusted price" = "black"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "sGARCH-Heston" = "steelblue",
+      "eGARCH-Heston" = "firebrick"
+    )
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y"
+  ) +
+  coord_cartesian(ylim = c(0, 600)) +
+  labs(
+    title = "Heston simulations using sGARCH and eGARCH volatility estimates",
+    subtitle = "Quantile bands and median paths compared with observed adjusted closing price",
+    x = "Date",
+    y = "Adjusted closing price",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 12),
+    legend.position = "bottom",
+    legend.text = element_text(size = 12),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+```{r}
+plot_heston_one <- function(paths_df, bands_df, model_title, sim_color) {
+  
+  ggplot() +
+    geom_ribbon(
+      data = bands_df,
+      aes(
+        x = date,
+        ymin = q05,
+        ymax = q95
+      ),
+      fill = sim_color,
+      alpha = 0.18
+    ) +
+    geom_ribbon(
+      data = bands_df,
+      aes(
+        x = date,
+        ymin = q25,
+        ymax = q75
+      ),
+      fill = sim_color,
+      alpha = 0.30
+    ) +
+    geom_line(
+      data = paths_df,
+      aes(
+        x = date,
+        y = value,
+        group = series
+      ),
+      color = sim_color,
+      alpha = 0.05,
+      linewidth = 0.25
+    ) +
+    geom_line(
+      data = bands_df,
+      aes(
+        x = date,
+        y = q50,
+        color = "Median simulated path"
+      ),
+      linewidth = 1.1,
+      alpha = 0.95,
+    ) +
+    geom_line(
+      data = real_price_df,
+      aes(
+        x = date,
+        y = value,
+        color = "Real adjusted price"
+      ),
+      linewidth = 1.25
+    ) +
+    scale_color_manual(
+      values = c(
+        "Median simulated path" = sim_color,
+        "Real adjusted price" = "black"
+      )
+    ) +
+    scale_x_date(
+      date_breaks = "2 years",
+      date_labels = "%Y"
+    ) +
+    coord_cartesian(ylim = c(0, 600)) +
+    labs(
+      title = model_title,
+      subtitle = "1000 sampled paths, quantile bands, and observed adjusted closing price",
+      x = "Date",
+      y = "Adjusted closing price",
+      color = NULL
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", size = 18),
+      plot.subtitle = element_text(size = 12),
+      legend.position = "bottom",
+      legend.text = element_text(size = 12),
+      panel.grid.minor = element_blank()
+    )
+}
+```
+
+```{r}
+p_heston_sGARCH <- plot_heston_one(
+  heston_paths_sGARCH,
+  heston_bands_sGARCH,
+  "Heston simulation using sGARCH volatility",
+  "steelblue"
+)
+
+p_heston_eGARCH <- plot_heston_one(
+  heston_paths_eGARCH,
+  heston_bands_eGARCH,
+  "Heston simulation using eGARCH volatility",
+  "firebrick"
+)
+```
+
+```{r}
+p_heston_sGARCH
+```
+
+```{r}
+p_heston_eGARCH
+```
+Nižšie môžeme vidieť hodnoty kvantilov simulovaných cien na konci sledovaného obdobia. Môžeme vidieť, že model podhodnocuje ceny (91 % cien je na konci nižšie ako reálna cena).
+
+```{r}
+terminal_sGARCH <- data.heston.sGARCH[nrow(data.heston.sGARCH), ]
+terminal_eGARCH <- data.heston.eGARCH[nrow(data.heston.eGARCH), ]
+
+real_terminal <- as.numeric(tail(prices, 1))
+
+terminal_summary <- data.frame(
+  model = c("sGARCH-Heston", "eGARCH-Heston"),
+  q01 = c(
+    quantile(terminal_sGARCH, 0.01),
+    quantile(terminal_eGARCH, 0.01)
+  ),
+  q05 = c(
+    quantile(terminal_sGARCH, 0.05),
+    quantile(terminal_eGARCH, 0.05)
+  ),
+  q25 = c(
+    quantile(terminal_sGARCH, 0.25),
+    quantile(terminal_eGARCH, 0.25)
+  ),
+  q50 = c(
+    quantile(terminal_sGARCH, 0.50),
+    quantile(terminal_eGARCH, 0.50)
+  ),
+  q75 = c(
+    quantile(terminal_sGARCH, 0.75),
+    quantile(terminal_eGARCH, 0.75)
+  ),
+  q95 = c(
+    quantile(terminal_sGARCH, 0.95),
+    quantile(terminal_eGARCH, 0.95)
+  ),
+  q99 = c(
+    quantile(terminal_sGARCH, 0.99),
+    quantile(terminal_eGARCH, 0.99)
+  ),
+  ratio_below_real = c(
+    mean(terminal_sGARCH <= real_terminal),
+    mean(terminal_eGARCH <= real_terminal)
+  )
+)
+
+terminal_summary
+```
+
+
+# Porovnanie modelov
+
+GBM poskytuje jednoduchý referenčný model, ktorý predpokladá konštantnú volatilitu a normálne rozdelené logaritmické výnosy. Tento model je ľahko interpretovateľný a jeho parametre sa dajú priamo odhadnúť z historických výnosov. Jeho hlavnou nevýhodou je, že nedokáže zachytiť zhlukovanie volatility a zmeny rizika v čase.
+
+Hestonov model je flexibilnejší, pretože volatilitu modeluje ako samostatný náhodný proces. Vďaka tomu dokáže vytvárať realistickejšie trajektórie v obdobiach, keď sa volatilita výrazne mení. V tejto práci však nejde o plnú trhovú kalibráciu Hestonovho modelu, keďže nie sú použité opčné dáta. Odhad volatility pomocou GARCH modelu je preto praktickou aproximáciou, nie presným pozorovaním latentnej volatility. Nakoniec tento model prináša horšie výsledky.
+
+```{r}
+gbm_bands_plot <- gbm_simulation_bands_df |>
+  mutate(model = "GBM") |>
+  select(date, model, q05, q25, q50, q75, q95)
+
+heston_sGARCH_bands_plot <- heston_bands_sGARCH |>
+  mutate(model = "Heston sGARCH") |>
+  select(date, model, q05, q25, q50, q75, q95)
+
+heston_eGARCH_bands_plot <- heston_bands_eGARCH |>
+  mutate(model = "Heston eGARCH") |>
+  select(date, model, q05, q25, q50, q75, q95)
+
+all_model_bands <- bind_rows(
+  gbm_bands_plot,
+  heston_sGARCH_bands_plot,
+  heston_eGARCH_bands_plot
+)
+
+ggplot() +
+  geom_ribbon(
+    data = all_model_bands,
+    aes(
+      x = date,
+      ymin = q05,
+      ymax = q95,
+      fill = model
+    ),
+    alpha = 0.12
+  ) +
+  geom_ribbon(
+    data = all_model_bands,
+    aes(
+      x = date,
+      ymin = q25,
+      ymax = q75,
+      fill = model
+    ),
+    alpha = 0.22
+  ) +
+  geom_line(
+    data = all_model_bands,
+    aes(
+      x = date,
+      y = q50,
+      color = model
+    ),
+    linewidth = 0.9
+  ) +
+  geom_line(
+    data = real_price_df,
+    aes(
+      x = date,
+      y = value,
+      color = "Real adjusted price"
+    ),
+    linewidth = 1.25
+  ) +
+  scale_color_manual(
+    values = c(
+      "GBM" = "darkgreen",
+      "Heston sGARCH" = "steelblue",
+      "Heston eGARCH" = "firebrick",
+      "Real adjusted price" = "black"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "GBM" = "darkgreen",
+      "Heston sGARCH" = "steelblue",
+      "Heston eGARCH" = "firebrick"
+    )
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y"
+  ) +
+  coord_cartesian(ylim = c(0, 600)) +
+  labs(
+    title = "Comparison of GBM and Heston simulations",
+    subtitle = "Quantile bands and median paths compared with real Air Liquide adjusted price",
+    x = "Date",
+    y = "Adjusted closing price",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 12),
+    legend.position = "bottom",
+    legend.text = element_text(size = 12),
+    panel.grid.minor = element_blank()
+  )
+```
+
+# Záver
+
+V práci boli analyzované upravené uzavieracie ceny akcií spoločnosti Air Liquide od roku 2000 po súčasnosť. Najprv boli z cien vypočítané logaritmické výnosy a preskúmané ich základné štatistické vlastnosti. Analýza ukázala, že predpoklad normálneho rozdelenia výnosov je iba zjednodušením, keďže finančné výnosy vykazujú odchýlky od normality a obdobia zvýšenej volatility.
+
+Následne bol odhadnutý geometrický Brownov pohyb, ktorý slúžil ako základný model s konštantnou volatilitou. Simulácie ukázali, že GBM dokáže zachytiť všeobecný náhodný charakter vývoja ceny.
+
+Druhým modelom bol Hestonov model so stochastickou volatilitou. Keďže okamžitá volatilita nie je priamo pozorovateľná, bola najprv odhadnutá pomocou sGARCH a eGARCH modelu. Takto získaný časový rad volatility bol použitý na odhad parametrov Hestonovho modelu. Hestonov model poskytuje realistickejší rámec pre modelovanie časovo premenlivej volatility, no jeho výsledky závisia od kvality odhadu latentnej volatility.
+
+Celkovo možno povedať, že GBM je vhodný ako jednoduchý východiskový model, zatiaľ čo Hestonov model lepšie vystihuje základnú vlastnosť finančných dát: volatilita nie je konštantná, ale mení sa v čase. Napriek väčšej komplexnosti, zdá sa, GBM opisuje dáta lepšie.
